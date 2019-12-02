@@ -45,3 +45,45 @@ val wordCounts = pairs.reduceByKey(_ + _)
 // Print the first ten elements of each RDD generated in this DStream to the console
 wordCounts.print()
 ```
+将 `words` DStream进一步`map`（一对一转换）到（word，1）对的DStream中，然后将其`reduce`以获取每批数据中单词的频率。最后，wordCounts.print（）将打印每秒生成的一些计数。
+
+请注意，执行这些行时，Spark Streaming仅设置启动时将执行的计算，但是尚未开始任何实际处理。我们最终可以执行
+```
+ssc.start()             // Start the computation
+ssc.awaitTermination()  // Wait for the computation to terminate
+```
+完整的代码可以在Spark Streaming示例[NetworkWordCount](https://github.com/apache/spark/blob/v2.4.4/examples/src/main/scala/org/apache/spark/examples/streaming/NetworkWordCount.scala)中找到。
+
+如果您已经下载并构建了Spark，则可以按以下方式运行此示例。您首先需要通过使用以下命令将Netcat（在大多数类Unix系统中找到的一个小实用程序）作为数据服务器运行
+```
+$ nc -lk 9999
+```
+然后，在另一个终端中，您可以通过使用
+```
+./bin/run-example streaming.NetworkWordCount localhost 9999
+```
+然后，将对运行netcat服务器的终端中键入的任何行进行计数并每秒打印一次。它将类似于以下内容。
+```
+# TERMINAL 1:
+# Running Netcat
+
+$ nc -lk 9999
+
+hello world
+
+
+
+...
+```
+``` scala
+# TERMINAL 2: RUNNING NetworkWordCount
+
+$ ./bin/run-example streaming.NetworkWordCount localhost 9999
+...
+-------------------------------------------
+Time: 1357008430000 ms
+-------------------------------------------
+(hello,1)
+(world,1)
+...
+```
