@@ -149,4 +149,28 @@ val ssc = new StreamingContext(sc, Seconds(1))
  * StreamingContext上的stop()也会停止SparkContext。要仅停止StreamingContext，请将名为stopSparkContext的stop()的可选参数设置为false。
  * 只要在创建下一个StreamingContext之前停止前一个StreamingContext(不停止SparkContext)，就可以重用SparkContext来创建多个StreamingContext。
 
-## 离散流（DStream)
+## 离散流（Discretized Streams(DStream))
+`Discretized Streams` 或者 `DStreams`是Spark流提供的基本抽象。它表示连续的数据流，可以是从数据源接收到的输入数据流，也可以是通过转换输入数据流生成的数据流。在内部，DStream由一系列连续的RDDs表示，这是Spark对不可变的分布式数据集的抽象（参见[Spark编程指南](http://spark.apache.org/docs/latest/rdd-programming-guide.html#resilient-distributed-datasets-rdds)了解更多细节。DStream中的每个RDD包含来自某个时间间隔的数据，如下图所示。
+![Spark Streaming Data Flow](./assets/streaming-dstream.png)
+
+应用于DStream上的任何操作都转换为底层RDDs上的操作。例如，在前面将一个行流转换为单词的示例中，flatMap操作应用于行DStream中的每个RDD，以生成 words DStream的RDDs。如下图所示。
+![Spark Streaming Data Flow](./assets/streaming-dstream-ops.png)
+
+这些底层的RDD转换是由Spark引擎计算的。DStream操作隐藏了这些细节中的大部分，并为开发人员提供了更高级的API。这些操作将在后面的小节中详细讨论。
+
+## 输入数据流和接收器(Input DStreams and Receivers)
+输入数据流是表示从数据源接收的输入数据流。在[quick示例](http://spark.apache.org/docs/latest/streaming-programming-guide.html#a-quick-example)中，lines 是一个输入DStream，它表示从netcat服务器接收到的数据流。每个输入DStream(本节后面讨论的文件流除外)都与接收方([Scala doc](http://spark.apache.org/docs/latest/api/scala/index.html#org.apache.spark.streaming.receiver.Receiver)、[Java doc](http://spark.apache.org/docs/latest/api/java/org/apache/spark/streaming/receiver/Receiver.html))对象相关联，接收方接收来自源的数据并将其存储在Spark内存中进行处理。
+Spark Streaming 提供了两类内置流数据源。
+ * 基本资源:StreamingContext API中直接可用的资源。示例:文件系统和套接字连接。
+ * 高级资源:像Kafka, Flume, Kinesis等资源可以通过额外的工具类获得。如链接部分所述，这些需要针对额外依赖项进行链接。
+ 我们将在本节后面讨论每个类别中的一些资源。
+
+ 注意，如果希望在流应用程序中并行接收多个数据流，可以创建多个输入DStreams(将在性能调优部分进一步讨论)。这将创建多个接收器，同时接收多个数据流。但是请注意，Spark worker/executor是一个长时间运行的任务，因此它占用分配给Spark流应用程序的一个内核。因此，重要的需要记住的是，Spark流应用程序需要分配足够的核心(或线程，如果在本地运行)来处理接收到的数据，以及运行接收方。
+**重要点**
+ * 在本地运行Spark流程序时，不要使用“local”或“local[1]”作为主URL。这两种方法都意味着只有一个线程将用于在本地运行任务。如果您使用基于接收器的输入DStream(例如sockets、Kafka、Flume等)，那么将使用单个线程来运行接收器，不留下任何线程来处理接收到的数据。因此，在本地运行时，始终使用“local[n]”作为主URL，其中要运行小于n个接收方(有关如何设置主接收方的信息，请参阅[Spark Properties](http://spark.apache.org/docs/latest/configuration.html#spark-properties))。
+ * 将逻辑扩展到在集群上运行，分配给Spark Streaming应用程序的内核数量必须大于接收器的数量。否则，系统将接收数据，但但却无法处理它。
+
+ ### 基础源(Basic Sources)
+
+ 我们已经在这个[快速的示例中](http://spark.apache.org/docs/latest/streaming-programming-guide.html#a-quick-example)看到了ssc.socketTextStream(…)，它根据通过TCP套接字连接接收的文本数据创建DStream。除了套接字之外，StreamingContext API还提供了将文件创建为输入源的方法。
+ #### 文件源(File Streams)
