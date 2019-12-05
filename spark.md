@@ -174,3 +174,70 @@ Spark Streaming 提供了两类内置流数据源。
 
  我们已经在这个[快速的示例中](http://spark.apache.org/docs/latest/streaming-programming-guide.html#a-quick-example)看到了ssc.socketTextStream(…)，它根据通过TCP套接字连接接收的文本数据创建DStream。除了套接字之外，StreamingContext API还提供了将文件创建为输入源的方法。
  #### 文件源(File Streams)
+对于从任何与HDFS API(即HDFS、S3、NFS等)兼容的文件系统上的文件中读取数据，可以通过 StreamingContext.fileStream[KeyClass ValueClass, InputFormatClass]创建DStream。
+
+文件流不需要运行接收器，因此不需要为接收文件数据分配任何内核。
+
+对于简单的文本文件，最简单的方法是StreamingContext.textFileStream(dataDirectory)。
+```Scala
+streamingContext.fileStream[KeyClass, ValueClass, InputFormatClass](dataDirectory)
+```
+对于文件类型
+```Scala
+streamingContext.textFileStream(dataDirectory)
+```
+**如何监控目录**
+
+Spark Streaming将监视目录dataDirectory并处理在该目录中创建的任何文件。
+ * 可以监视一个简单的目录，比如“hdfs://namenode:8040/logs/”。位于该路径下的所有文件发现时将被处理。
+ * 可以提供[POSIX glob模式](http://pubs.opengroup.org/onlinepubs/009695399/utilities/xcu_chap02.html#tag_02_13_02)，例如“hdfs://namenode:8040/logs/2017/*”。在这里，DStream将包含与模式匹配的目录中的所有文件。也就是说:它是目录的模式，而不是目录中的文件。
+ * 所有文件必须采用相同的数据格式。
+ * 一个文件被认为是基于其修改时间而不是创建时间的时间段的一部分。
+ * 处理后，对当前窗口内文件的更改将不会导致文件被重新读取。也就是说:更新被忽略。
+ * 目录下的文件越多，扫描更改所需的时间就越长——即使没有修改任何文件。
+ * 如果使用通配符来标识目录，如“hdfs://namenode:8040/logs/2016-*”，则重命名整个目录以匹配路径将该目录添加到受监视的目录列表中。只有修改时间在当前窗口内的目录中的文件才会包含在流中。
+ * 调用FileSystem.setTimes()来修正时间戳是在以后的处理窗口中获取文件的一种方法，即使它的内容没有改变。
+**使用对象存储作为数据源**
+像HDFS这样的“Full”文件系统倾向于在创建输出流时立即设置文件的修改时间。当一个文件被打开时，甚至在数据被完全写入之前，它就被包含在DStream中——在此之后，同一窗口内的文件更新将被忽略。也就是说:变更可能被遗漏，数据可能从流中被遗漏。
+
+要确保在窗口中进行更改，请将文件写入未监视的目录，然后在关闭输出流之后立即将其重命名为目标目录。如果重新命名的文件在处理窗口时间内出现在扫描的目标目录中，则新数据将被处理。
+
+相反，像Amazon S3和Azure Storage这样的对象存储通常有较慢的重命名操作，因为数据实际上是被复制的。此外，重命名的对象可能将rename()操作的时间作为其修改时间，因此可能不被认为是窗口的一部分，而新对象的创建时间意味着它们是窗口的一部分。
+
+需要对目标对象存储进行仔细的测试，以验证存储的时间戳行为与Spark Streaming所期望的一致。直接写入目标目录可能是通过所选对象存储流数据的适当策略。
+
+关于这个主题的更多细节，请参考[Hadoop文件系统规范](https://hadoop.apache.org/docs/stable2/hadoop-project-dist/hadoop-common/filesystem/introduction.html)。
+
+#### 基于自定义接收器的流(Streams based on Custom Receivers)
+可以使用通过自定义接收器接收的数据流创建DStreams。有关详细信息，请参阅[自定义接收方](http://spark.apache.org/docs/latest/streaming-custom-receivers.html)指南。
+
+**将RDDs队列作为流**
+要使用测试数据测试Spark流应用程序，还可以使用streamingContext.queueStream(queueOfRDDs)创建基于RDDs队列的DStream。推入队列的每个RDD将被视为DStream中的一批数据，并像流一样进行处理。
+
+有关套接字流和文件流的更多信息，请参见Scala的[StreamingContext](http://spark.apache.org/docs/latest/api/scala/index.html#org.apache.spark.streaming.StreamingContext)、Java的[JavaStreamingContext](http://spark.apache.org/docs/latest/api/java/index.html?org/apache/spark/streaming/api/java/JavaStreamingContext.html)和Python的[StreamingContext](http://spark.apache.org/docs/latest/api/python/pyspark.streaming.html#pyspark.streaming.StreamingContext)中相关函数的API文档。
+
+### 先进的来源(Advanced Sources)
+**Python API** 从Spark 2.4.4开始，在这些源代码中，Kafka、Kinesis和Flume都可以在Python API中找到。
+
+这类源需要与外部非spark库交互，其中一些具有复杂的依赖关系(例如Kafka和Flume)。因此，为了最小化与版本依赖冲突相关的问题，从这些源创建DStreams的功能已经转移到单独的库中，在必要时可以显式地[链接](http://spark.apache.org/docs/latest/streaming-programming-guide.html#linking)到这些库。
+
+注意，这些高级数据源在Spark shell中不可用，因此基于这些高级数据源的应用程序不能在shell中测试。如果您真的想在Spark shell中使用它们，那么您必须下载相应的Maven工件及其依赖项，并将其添加到类路径中。
+
+这些先进的来源如下。
+
+ * **kafka**: Spark Streaming 2.4.4与Kafka代版本0.8.2.1或更高兼容。有关更多细节，请参阅[Kafka集成指南](http://spark.apache.org/docs/latest/streaming-kafka-integration.html)。
+ * **Flume**: Spark Streaming 2.4.4与Flume 1.6.0兼容。有关更多细节，请参阅[Flume集成指南](http://spark.apache.org/docs/latest/streaming-flume-integration.html)。
+ * **kinesis **: Spark Streaming2.4.4与Kinesis客户端库1.2.1兼容。有关更多细节，请参阅[kinesis集成指南](http://spark.apache.org/docs/latest/streaming-kinesis-integration.html)。
+### 定制源(Custom Sources)
+**Python API** Python中还不支持这一点。
+还可以从自定义数据源创建输入DStreams。您所要做的就是实现一个用户定义的接收器(请参阅下一节了解它是什么)，它可以接收来自自定义源的数据并将其推入Spark。有关详细信息，请参阅自定义接收方指南。
+
+### 接收器的可靠性(Receiver Reliability)
+
+基于数据源的可靠性，可以划分两种数据源。数据源(如Kafka和Flume)允许确认传输的数据。如果从这些可靠来源接收数据的系统正确地确认接收到的数据，则可以确保不会由于任何类型的故障而丢失任何数据。这就导致了两种类型的接受者:
+ 1. *可靠的接收器* —— 一个可靠的接收器发送确认到一个可靠的来源时，数据已被分片接收和存储在Spark。
+ 2. *不可靠的接收方* —— 不可靠的接收方不会向源发送确认信息。这用于不支持确认的源，甚至可以用于不希望或不需要进入确认复杂性的可靠源。
+
+如何编写可靠的接收器的详细信息在[自定义接收器](http://spark.apache.org/docs/latest/streaming-custom-receivers.html)指南中进行了讨论。
+
+## 转换DStreams(Transformations on DStreams)
