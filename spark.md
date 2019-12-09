@@ -241,3 +241,11 @@ Spark Streaming将监视目录dataDirectory并处理在该目录中创建的任�
 如何编写可靠的接收器的详细信息在[自定义接收器](http://spark.apache.org/docs/latest/streaming-custom-receivers.html)指南中进行了讨论。
 
 ## 转换DStreams(Transformations on DStreams)
+与RDDs类似，转换允许修改输入DStream中的数据。DStreams支持许多在普通Spark RDD上可用的转换。一些常见的操作如下。
+转换|意义
+-|-
+map(func)|通过函数func转换源DStream的每个元素来返回一个新的DStream。
+flatMap(func)|与map类似，但是每个输入项可以映射到0或多个输出项。
+filter(func)|通过只选择func返回true的源DStream的记录来返回一个新的DStream。
+repartition(numPartitions)|通过创建更多或更少的分区来改变DStream中的并行度。
+union(otherStream)|返回一个新的DStream，它包含源DStream和otherDStream中元素的并集。
