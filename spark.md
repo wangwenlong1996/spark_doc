@@ -249,3 +249,94 @@ flatMap(func)|与map类似，但是每个输入项可以映射到0或多个输�
 filter(func)|通过只选择func返回true的源DStream的记录来返回一个新的DStream。
 repartition(numPartitions)|通过创建更多或更少的分区来改变DStream中的并行度。
 union(otherStream)|返回一个新的DStream，它包含源DStream和otherDStream中元素的并集。
+count()|通过计算源DStream的每个RDD中的元素数量，返回一个新的单元素RDDs DStream。
+reduce(func)|通过使用函数func(接受两个参数并返回一个参数)聚合源DStream的每个RDD中的元素，返回一个新的单元素RDDs DStream。这个函数应该是结合律和交换律，这样才能并行计算。
+countByValue()|当对类型为K的元素的DStream调用时，返回一个新的DStream (K, Long)对，其中每个键的值是它在源DStream的每个RDD中的频率。
+reduceByKey(func, [numTasks])|当在(K, V)对的DStream上调用时，返回一个新的(K, V)对的DStream，其中每个键的值使用给定的reduce函数进行聚合。注意:在默认情况下，这将使用Spark的默认并行任务数(本地模式为2，而在集群模式下，该数量由配置属性Spark .default.parallelism决定)来进行分组。您可以传递一个可选的numTasks参数来设置不同数量的任务。
+join(otherStream, [numTasks])|当调用两个DStream (K, V)和(K, W)对时，返回一个新的DStream (K， (V, W))对，包含每个键的所有对的元素。
+cogroup(otherStream, [numTasks])|当调用(K, V)和(K, W)对的DStream时，返回一个新的(K, Seq[V]， Seq[W])元组DStream。
+transform(func)|通过对源DStream的每个RDD应用一个RDD-to-RDD函数来返回一个新的DStream。这可以用来在DStream上执行任意的RDD操作。
+updateStateByKey(func)|返回一个新的“state”DStream，其中通过对键的前一个状态和键的新值应用给定的函数来更新每个键的状态。这可以用来维护每个键的状态数据。
+其中一些转换值得更详细地讨论。
+### UpdateStateByKey操作
+`updateStateByKey`操作允许您维护任意状态，同时不断地用新信息更新它。要使用它，您必须执行两个步骤。
+ 1. 定义状态——状态可以是任意的数据类型。
+ 2. 定义状态更新函数——使用一个函数指定如何使用输入流中的前一个状态和新值来更新状态。
+
+在每个批处理中，Spark将对所有现有键应用状态更新功能，而不管它们在批处理中是否有新数据。如果更新函数返回None，则键值对将被删除。
+
+让我们用一个例子来说明这一点。假设您希望维护在文本数据流中看到的每个单词的运行计数。这里，运行计数是状态，它是一个整数。我们将更新函数定义为:
+```Scala
+def updateFunction(newValues: Seq[Int], runningCount: Option[Int]): Option[Int] = {
+    val newCount = ...  // add the new values with the previous running count to get the new count
+    Some(newCount)
+}
+```
+这将应用于包含单词的DStream(例如，[前面示例](https://spark.apache.org/docs/latest/streaming-programming-guide.html#a-quick-example)中包含(word，1)对的DStream)。
+```Scala
+val runningCounts = pairs.updateStateByKey[Int](updateFunction _)
+```
+每个单词都将调用update函数，newValues的序列为1(来自(word, 1)对)，runningCount的序列为前一个计数。
+注意，使用updateStateByKey需要配置检查点目录，检查点一节将对此进行详细讨论。
+
+### 转换运算(Transform Operation)
+`transform`操作(及其变体，如`transformWith`)允许在DStream上应用任意的RDD-to-RDD函数。它可以用于应用DStream API中没有公开的任何RDD操作。例如，将数据流中的每个批处理与另一个`dataset` join的功能并没有直接在DStream API中公开。但是，您可以很容易地使用transform来实现这一点。这带来了非常强大的可能性。例如，可以通过将输入数据流与预先计算的垃圾邮件信息(也可以使用Spark生成)连接起来，然后根据这些信息进行过滤，从而进行实时数据清理。
+```Scala
+val spamInfoRDD = ssc.sparkContext.newAPIHadoopRDD(...) // RDD containing spam information
+
+val cleanedDStream = wordCounts.transform { rdd =>
+  rdd.join(spamInfoRDD).filter(...) // join data stream with spam information to do data cleaning
+  ...
+}
+```
+注意，提供的函数在每个批处理间隔中被调用。这允许您执行时变换操作RDD，即RDD操作、分区数量、广播变量等可以在批处理期间更改。
+
+### 窗口操作(Window Operations)
+Spark Streaming还提供了窗口计算，它允许您在数据的滑动窗口上应用转换。下图演示了这个滑动窗口。
+![streaming-dstream-window](assets/streaming-dstream-window.png)
+
+如图所示，每当窗口在源DStream上滑动时，位于窗口内的源RDDs就会被执行合并操作，以生成窗口化的DStream的RDDs。在本例中，操作应用于数据的3个时间单位，滑动2个时间单位。这表明任何窗口操作都需要指定两个参数。
+ * 窗口长度 -— 窗口的持续时间(图中为3)。
+ * 滑动时间间隔 -- 窗口操作执行的时间间隔(图中为2)。
+这两个参数必须是源DStream的批处理间隔的倍数(图中为1)。
+
+让我们用一个例子来说明窗口操作。例如，您希望通过每10秒在最后30秒的数据中生成字数计数来扩展[前面的示例](https://spark.apache.org/docs/latest/streaming-programming-guide.html#a-quick-example)。为此，我们必须在最后30秒的数据中对(word, 1)对的DStream应用reduceByKey操作。这是使用reduceByKeyAndWindow操作完成的。
+```scala
+// Reduce last 30 seconds of data, every 10 seconds
+val windowedWordCounts = pairs.reduceByKeyAndWindow((a:Int,b:Int) => (a + b), Seconds(30), Seconds(10))
+```
+下面是一些常见的窗口操作。所有这些操作都采用上述两个参数——窗口长度和滑动间隔。
+操作|意义
+-|-
+window(windowLength, slideInterval)|返回一个新的DStream，它是基于源DStream的加窗批量计算的。
+countByWindow(windowLength, slideInterval)|返回流中元素的滑动窗口计数。
+reduceByWindow(func, windowLength, slideInterval)|返回一个新的单元素流，它是通过使用func将流中的元素在一个滑动区间内聚合而创建的。这个函数应该是结合律和交换律，这样才能正确地并行计算。
+reduceByKeyAndWindow(func, windowLength, slideInterval, [numTasks])|当在一个(K, V)对的DStream上调用时，返回一个新的(K, V)对的DStream，每个键的值使用指定的reduce函数func在滑动窗口中进行聚合。注意:默认情况下，这将使用Spark的默认并行任务数(本地模式为2，而在集群模式下，该数值由配置属性spark.default.parallelism决定)进行分组。您可以传递一个可选的numTasks参数来设置不同数量的任务。
+reduceByKeyAndWindow(func, invFunc, windowLength, slideInterval, [numTasks])|上面的reduceByKeyAndWindow()的一个更有效的版本，其中每个窗口的reduce值是使用前一个窗口的reduce值递增计算的。这是通过减少进入滑动窗口的新数据和“反向减少”离开窗口的旧数据来实现的。例如，在窗口滑动时“添加”和“减去”键数。但是，它只适用于“可逆约简函数”，即具有相应“逆约简”函数的约简函数(取参数invFunc)。与reduceByKeyAndWindow一样，reduce任务的数量可以通过一个可选参数进行配置。注意，必须启用检查点才能使用此操作。
+countByValueAndWindow(windowLength, slideInterval, [numTasks])|当调用一个(K, V)对的DStream时，返回一个新的(K, Long)对的DStream，其中每个键的值是它在滑动窗口中的频率。与reduceByKeyAndWindow一样，reduce任务的数量可以通过一个可选参数进行配置。
+
+### Join操作(Join Operations)
+最后，值得强调一下在Spark Streaming中执行不同类型的`Join`是多么容易。
+**Stream-stream连接**
+Streams可以很容易地与其他Streams连接。
+```Scala
+val stream1: DStream[String, String] = ...
+val stream2: DStream[String, String] = ...
+val joinedStream = stream1.join(stream2)
+```
+在这里，在每个批处理间隔中，由stream1生成的RDD将与由stream2生成的RDD相连接。你也可以使用leftOuterJoin, rightOuterJoin, fullOuterJoin。此外，在流的窗口上进行连接通常非常有用。这也很简单。
+```Scala
+val windowedStream1 = stream1.window(Seconds(20))
+val windowedStream2 = stream2.window(Minutes(1))
+val joinedStream = windowedStream1.join(windowedStream2)
+```
+**Stream-dataset连接**
+在前面的说明DStream.transform 中已经显示了这一点。变换操作。下面是另一个将窗口化的流与数据集连接的示例。
+```Scala
+val dataset: RDD[String, String] = ...
+val windowedStream = stream.window(Seconds(20))...
+val joinedStream = windowedStream.transform { rdd => rdd.join(dataset) }
+```
+实际上，您还可以动态地更改要加入的数据集。提供的转换函数在每个批处理间隔进行评估，将使用数据集引用点指向的当前数据集。
+
+DStream转换的完整列表在API文档中提供。有关Scala API，请参见[DStream](https://spark.apache.org/docs/latest/api/scala/index.html#org.apache.spark.streaming.dstream.DStream)和[PairDStreamFunctions](https://spark.apache.org/docs/latest/api/scala/index.html#org.apache.spark.streaming.dstream.PairDStreamFunctions)。有关Java API，请参见[JavaDStream](https://spark.apache.org/docs/latest/api/java/index.html?org/apache/spark/streaming/api/java/JavaDStream.html)和[JavaPairDStream](https://spark.apache.org/docs/latest/api/java/index.html?org/apache/spark/streaming/api/java/JavaPairDStream.html)。有关Python API，请参阅[DStream](https://spark.apache.org/docs/latest/api/python/pyspark.streaming.html#pyspark.streaming.DStream)。
