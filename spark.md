@@ -340,3 +340,71 @@ val joinedStream = windowedStream.transform { rdd => rdd.join(dataset) }
 实际上，您还可以动态地更改要加入的数据集。提供的转换函数在每个批处理间隔进行评估，将使用数据集引用点指向的当前数据集。
 
 DStream转换的完整列表在API文档中提供。有关Scala API，请参见[DStream](https://spark.apache.org/docs/latest/api/scala/index.html#org.apache.spark.streaming.dstream.DStream)和[PairDStreamFunctions](https://spark.apache.org/docs/latest/api/scala/index.html#org.apache.spark.streaming.dstream.PairDStreamFunctions)。有关Java API，请参见[JavaDStream](https://spark.apache.org/docs/latest/api/java/index.html?org/apache/spark/streaming/api/java/JavaDStream.html)和[JavaPairDStream](https://spark.apache.org/docs/latest/api/java/index.html?org/apache/spark/streaming/api/java/JavaPairDStream.html)。有关Python API，请参阅[DStream](https://spark.apache.org/docs/latest/api/python/pyspark.streaming.html#pyspark.streaming.DStream)。
+
+## DStreams上的输出操作(Output Operations on DStreams)
+
+输出操作允许将DStream的数据推送到外部系统，如数据库或文件系统。由于输出操作实际上允许外部系统使用转换后的数据，因此它们会触发所有DStream转换的实际执行(类似于RDDs的actions)。目前定义了以下输出操作:
+输出操作| 意义
+-|-
+print()| 在运行流应用程序的驱动节点上打印DStream中每批数据的前十个元素。这对于开发和调试非常有用。`Python API`这在Python API中称为pprint()。
+saveAsTextFiles(prefix, [suffix])| 将DStream的内容保存为文本文件。每个批处理间隔的文件名是根据前缀和后缀“prefix-TIME_IN_MS[.suffix]”生成的。
+saveAsObjectFiles(prefix, [suffix])|将这个DStream的内容保存为序列化的Java对象的序列文件。每个批处理间隔的文件名是根据前缀和后缀“prefix-TIME_IN_MS[.suffix]”生成的。`Python API` 这在Python API中不可用。
+saveAsHadoopFiles(prefix, [suffix])|将DStream的内容保存为Hadoop文件。每个批处理间隔的文件名是根据前缀和后缀“prefix-TIME_IN_MS[.suffix]”生成的。
+foreachRDD(func)|将函数func应用于从流生成的每个RDD的最通用的输出操作符。该函数应该将每个RDD中的数据推送到外部系统，例如将RDD保存到文件中，或者通过网络将其写入数据库。请注意，func函数是在运行流应用程序的驱动程序进程中执行的，并且通常会有RDD动作(action)，这将强制流RDDs的计算。
+
+### 使用foreachRDD的设计模式(Design Patterns for using foreachRDD)
+输出操作允许将DStream的数据推送到外部系统，如数据库或文件系统。然而，理解如何正确和有效地使用这个原语是很重要的。要避免的一些常见错误如下。
+
+通常，将数据写入外部系统需要创建一个连接对象(例如，到远程服务器的TCP连接)并使用它将数据发送到远程系统。为此，开发人员可能会无意中尝试在Spark驱动程序中创建连接对象，然后尝试在Spark worker中使用它来保存RDDs中的记录。例如(在Scala中)。
+
+```Scala
+dstream.foreachRDD { rdd =>
+  val connection = createNewConnection()  // executed at the driver
+  rdd.foreach { record =>
+    connection.send(record) // executed at the worker
+  }
+}
+```
+
+这是不正确的，因为这需要将连接对象序列化并从驱动程序发送到工作程序。这样的连接对象很少能跨机器转移。此错误可能表现为序列化错误(连接对象不可序列化)、初始化错误(连接对象需要在工作人员处初始化)等。正确的解决方案是在worker上创建连接对象。
+
+然而，这可能会导致另一个常见错误——为每个记录创建一个新连接。例如,
+```Scala
+dstream.foreachRDD { rdd =>
+  rdd.foreach { record =>
+    val connection = createNewConnection()
+    connection.send(record)
+    connection.close()
+  }
+}
+```
+
+通常，创建连接对象需要时间和资源开销。因此，为每个记录创建和销毁一个连接对象可能导致不必要的高开销，并可能显著降低系统的总体吞吐量。更好的解决方案是使用rdd.foreachPartition——创建一个连接对象，并使用该连接发送RDD分区中的所有记录。
+```Scala
+dstream.foreachRDD { rdd =>
+  rdd.foreachPartition { partitionOfRecords =>
+    val connection = createNewConnection()
+    partitionOfRecords.foreach(record => connection.send(record))
+    connection.close()
+  }
+}
+```
+
+这会将创建连接的开销分摊到许多记录上。
+
+最后，可以通过跨多个RDDs/batch重用连接对象来进一步优化。可以维护一个静态的连接对象池，在将多个批的RDDs推送到外部系统时可以重用这些对象，从而进一步减少开销。
+```Scala
+dstream.foreachRDD { rdd =>
+  rdd.foreachPartition { partitionOfRecords =>
+    // ConnectionPool is a static, lazily initialized pool of connections
+    val connection = ConnectionPool.getConnection()
+    partitionOfRecords.foreach(record => connection.send(record))
+    ConnectionPool.returnConnection(connection)  // return to the pool for future reuse
+  }
+}
+```
+
+请注意，池中的连接应该按需延迟创建，如果不使用一段时间就会超时。这实现了向外部系统发送数据的最高效。
+其他注意事项:
+ * DStreams的输出操作是延迟执行，就像RDD操作延迟执行一样。具体来说，DStream输出操作中的RDD操作强制处理接收到的数据。因此，如果您的应用程序没有任何输出操作，或者有像dstream.foreachRDD()这样的输出操作，但是其中没有任何RDD操作，那么什么也不会执行。系统将简单地接收数据并丢弃它。
+  * 默认情况下，一次执行一个输出操作。它们是按照在应用程序中定义的顺序执行的。
