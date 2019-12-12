@@ -408,3 +408,157 @@ dstream.foreachRDD { rdd =>
 其他注意事项:
  * DStreams的输出操作是延迟执行，就像RDD操作延迟执行一样。具体来说，DStream输出操作中的RDD操作强制处理接收到的数据。因此，如果您的应用程序没有任何输出操作，或者有像dstream.foreachRDD()这样的输出操作，但是其中没有任何RDD操作，那么什么也不会执行。系统将简单地接收数据并丢弃它。
   * 默认情况下，一次执行一个输出操作。它们是按照在应用程序中定义的顺序执行的。
+
+## DataFrame和SQL操作(DataFrame and SQL Operations)
+
+您可以轻松地在流数据上使用[DataFrames和SQL](https://spark.apache.org/docs/latest/sql-programming-guide.html)操作。 您必须使用StreamingContext正在使用的SparkContext创建SparkSession。此外，这样做可以在驱动程序失败时重新启动。这是通过创建一个延迟实例化的SparkSession单例来实现的。如下面的例子所示。它修改了前面的字数统计示例，以使用DataFrames和SQL生成字数统计。每个RDD都被转换为一个DataFrame，注册为一个临时表，然后使用SQL进行查询。
+```Scala
+val words: DStream[String] = ...
+
+words.foreachRDD { rdd =>
+
+  // Get the singleton instance of SparkSession
+  val spark = SparkSession.builder.config(rdd.sparkContext.getConf).getOrCreate()
+  import spark.implicits._
+
+  // Convert RDD[String] to DataFrame
+  val wordsDataFrame = rdd.toDF("word")
+
+  // Create a temporary view
+  wordsDataFrame.createOrReplaceTempView("words")
+
+  // Do word count on DataFrame using SQL and print it
+  val wordCountsDataFrame =
+    spark.sql("select word, count(*) as total from words group by word")
+  wordCountsDataFrame.show()
+}
+```
+查看完整的[源代码](https://github.com/apache/spark/blob/v2.4.4/examples/src/main/scala/org/apache/spark/examples/streaming/SqlNetworkWordCount.scala)。
+
+您还可以执行SQL查询在不同线程(即与运行中的StreamingContext异步)的流数据上定义的表。必须确保您设置了StreamingContext来记住足够数量的流数据，以便查询可以运行。则，StreamingContext(它不知道任何异步SQL查询)将在查询完成之前删除旧的流数据。例如，如果您想要查询上一批数据，但是您的查询可能需要5分钟才能运行完成，那么可以调用streamingContext.remember(minutes(5))(在Scala中，或在其他语言中等效)。
+
+参见{DataFrames和SQL](https://spark.apache.org/docs/latest/sql-programming-guide.html)指南以了解更多关于DataFrames的信息。
+
+## MLlib操作(MLlib Operations)
+
+您还可以轻松使用[MLlib](https://spark.apache.org/docs/latest/ml-guide.html)提供的机器学习算法。首先，有流式机器学习算法(如[流式线性回归](https://spark.apache.org/docs/latest/mllib-linear-methods.html#streaming-linear-regression)、[流式KMeans](https://spark.apache.org/docs/latest/mllib-clustering.html#streaming-k-means)等)可以同时学习流式数据，也可以将模型应用到流式数据上。除此之外，对于更大类别的机器学习算法，您可以离线学习一个算法模型(即使用历史数据)，然后在线将该模型应用于流数据。有关更多细节，请参阅[MLlib](https://spark.apache.org/docs/latest/ml-guide.html)指南。
+
+## 缓存/持久性(Caching / Persistence)
+
+与RDDs类似，DStreams还允许开发人员将流的数据持久化到内存中。也就是说，在DStream上使用persist()方法将自动在内存中持久化该DStream的每个RDD。如果DStream中的数据将被多次计算(例如，对同一数据的多次操作)，那么这是非常有用的。对于基于窗口的操作，如reduceByWindow和reduceByKeyAndWindow，以及基于状态的操作，如updateStateByKey，这是隐式正确的。因此，由基于窗口的操作生成的DStreams将自动持久化到内存中，而无需开发人员调用persist()。
+
+对于通过网络接收数据的输入流(例如，Kafka、Flume、sockets等)，默认的持久性级别被设置为将数据复制到两个节点以实现容错。
+
+注意，与RDDs不同，DStreams的默认持久性级别是在内存中序列化数据。这将在[性能调优](https://spark.apache.org/docs/latest/streaming-programming-guide.html#memory-tuning)一节中进一步讨论。有关不同持久性级别的更多信息可以在[Spark编程指南](https://spark.apache.org/docs/latest/rdd-programming-guide.html#rdd-persistence)中找到。
+
+## 检查点(checkpointing)
+
+流应用程序必须7*24小时运行，因此必须对与应用程序逻辑无关的故障具有弹性(例如，系统故障、JVM崩溃等)。为了实现这一点，Spark Streaming需要将足够的信息检查点存储到容错存储系统，以便从故障中恢复。默认有两种类型的数据检查点。
+
+ * **元数据的检查点** -- 将定义流计算的信息保存到容错存储器(如HDFS)。这用于从运行流应用程序的驱动程序的节点的故障中恢复(稍后将详细讨论)。元数据包括:
+     * 配置——用于创建流应用程序的配置。
+     * DStream操作——定义流应用程序的一组DStream操作。
+     * 未完成的批——其作业在队列中但尚未完成的批数据。
+  * 数据检查点——将生成的RDDs保存到可靠的存储中。在跨多个批组合数据的一些有状态转换中，这是必需的。在这种转换中，生成的RDDs依赖于前一批的RDDs，这导致依赖链的长度随时间不断增加。为了避免这种恢复时间的无界增长(与依赖链成比例)，有状态转换的中间rdd会定期检查可靠存储(如HDFS)，以切断依赖链。
+
+总之，元数据检查点主要用于从驱动程序故障中恢复，而数据或RDD检查点对于使用有状态转换的基本功能也是必要的。
+
+### 何时启用检查点(When to enable Checkpointing)
+
+有下列任何一项要求的应用必须启用检查点:
+ * 使用有状态转换——如果在应用程序中使用updateStateByKey或reduceByKeyAndWindow(带有逆函数)，那么必须提供检查点目录来允许定期的RDD检查。
+  * 从运行应用程序的驱动程序的故障中恢复——使用元数据检查点来恢复进度信息。
+
+注意，没有上述有状态转换的简单流应用程序可以在不启用检查点的情况下运行。在这种情况下，从驱动程序故障中恢复也是部分的(一些接收到但未处理的数据可能丢失)。许多以这种方式运行Spark流应用程序通常是可以接受的。对非hadoop环境的支持有望在未来得到改善。
+
+### 如何配置检查点(How to configure Checkpointing)
+
+检查点可以通过在一个容错的、可靠的文件系统(如HDFS、S3等)中设置一个目录来启用，检查点信息将保存到该目录中。这是通过使用streamingContext.checkpoint(checkpointDirectory)实现的。这将允许您使用前面提到的有状态转换。此外，如果希望应用程序从驱动程序故障中恢复，应该重写流应用程序，使其具有以下行为。
+ * 当程序第一次启动时，它将创建一个新的StreamingContext，设置所有的streams，然后调用start()。
+ * 当程序在失败后重新启动时，它将从检查点目录中的检查点数据重新创建一个StreamingContext。
+
+通过使用StreamingContext.getOrCreate可以简化此行为。它的用法如下。进入翻译页面
+ ```scala
+ // Function to create and setup a new StreamingContext
+def functionToCreateContext(): StreamingContext = {
+  val ssc = new StreamingContext(...)   // new context
+  val lines = ssc.socketTextStream(...) // create DStreams
+  ...
+  ssc.checkpoint(checkpointDirectory)   // set checkpoint directory
+  ssc
+}
+
+// Get StreamingContext from checkpoint data or create a new one
+val context = StreamingContext.getOrCreate(checkpointDirectory, functionToCreateContext _)
+
+// Do additional setup on context that needs to be done,
+// irrespective of whether it is being started or restarted
+context. ...
+
+// Start the context
+context.start()
+context.awaitTermination()
+
+```
+
+如果存在checkpointDirectory，那么将从检查点数据重新创建上下文。如果该目录不存在(即，然后调用functionToCreateContext函数创建新上下文并设置DStreams。参见Scala示例[RecoverableNetworkWordCount](https://github.com/apache/spark/tree/master/examples/src/main/scala/org/apache/spark/examples/streaming/RecoverableNetworkWordCount.scala。此示例将网络数据的单词计数附加到文件中。
+
+除了使用getOrCreate之外，还需要确保驱动程序进程在失败时自动重新启动。这只能由用于运行应用程序的部署基础设施来完成。这将在[部署](https://spark.apache.org/docs/latest/streaming-programming-guide.html#deploying-applications)一节中进一步讨论。
+
+注意，RDDs的检查点会增加将数据保存到可靠存储的成本。这可能会导致RDDs被检查点的那些批次的处理时间增加。因此，需要仔细设置检查点的间隔。在小批量情况下(比如1秒)，每批检查可能会显著降低操作吞吐量。相反，检查点太少会导致沿袭和任务大小增长，这可能会产生有害的影响。对于需要RDD检查点的有状态转换，默认间隔是至少10秒的批处理间隔的倍数。可以使用dstream.checkpoint(checkpointInterval)设置它。通常，一个DStream的5 - 10个滑动间隔的检查点间隔是一个很好的设置。
+
+## 累加器、广播变量和检查点(Accumulators, Broadcast Variables, and Checkpoints)
+
+无法从Spark Streaming中的检查点恢复累加器和广播变量。如果启用了检查点并同时使用累加器或广播变量，则必须为累加器和广播变量创建延迟实例化的单例实例，以便在驱动程序失败重新启动后重新实例化它们。如下面的例子所示。
+```Scala
+object WordBlacklist {
+
+  @volatile private var instance: Broadcast[Seq[String]] = null
+
+  def getInstance(sc: SparkContext): Broadcast[Seq[String]] = {
+    if (instance == null) {
+      synchronized {
+        if (instance == null) {
+          val wordBlacklist = Seq("a", "b", "c")
+          instance = sc.broadcast(wordBlacklist)
+        }
+      }
+    }
+    instance
+  }
+}
+
+object DroppedWordsCounter {
+
+  @volatile private var instance: LongAccumulator = null
+
+  def getInstance(sc: SparkContext): LongAccumulator = {
+    if (instance == null) {
+      synchronized {
+        if (instance == null) {
+          instance = sc.longAccumulator("WordsInBlacklistCounter")
+        }
+      }
+    }
+    instance
+  }
+}
+
+wordCounts.foreachRDD { (rdd: RDD[(String, Int)], time: Time) =>
+  // Get or register the blacklist Broadcast
+  val blacklist = WordBlacklist.getInstance(rdd.sparkContext)
+  // Get or register the droppedWordsCounter Accumulator
+  val droppedWordsCounter = DroppedWordsCounter.getInstance(rdd.sparkContext)
+  // Use blacklist to drop words and use droppedWordsCounter to count them
+  val counts = rdd.filter { case (word, count) =>
+    if (blacklist.value.contains(word)) {
+      droppedWordsCounter.add(count)
+      false
+    } else {
+      true
+    }
+  }.collect().mkString("[", ", ", "]")
+  val output = "Counts at time " + time + " " + counts
+})
+```
+查看完整的[源代码](https://github.com/apache/spark/blob/v2.4.4/examples/src/main/scala/org/apache/spark/examples/streaming/RecoverableNetworkWordCount.scala)。
