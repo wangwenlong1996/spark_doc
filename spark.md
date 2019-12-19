@@ -1,4 +1,3 @@
-[TOC]
 # 总览
 Spark Streaming 是Spark core API的扩展，支持可伸缩、高吞吐量、容错的实时数据流处理。数据可以从许多来源获取，如Kafka、Flume、Kinesis或TCP sockets，可以使用复杂的算法处理数据，这些算法用高级函数表示，如map、reduce、join和window。最后，处理后的数据可以推送到文件系统、数据库和活动仪表板。实际上，您可以将Spark的机器学习和图处理算法应用于数据流。
 @import "assets/spark_streaming_1.png"{width="300px" height="200px" title="Spark Streaming architecture" alt=""}
@@ -563,3 +562,39 @@ wordCounts.foreachRDD { (rdd: RDD[(String, Int)], time: Time) =>
 })
 ```
 查看完整的[源代码](https://github.com/apache/spark/blob/v2.4.4/examples/src/main/scala/org/apache/spark/examples/streaming/RecoverableNetworkWordCount.scala)。
+
+
+## 部署应用(Deploying Applications)
+
+本节讨论部署Spark流应用程序的步骤。
+
+### 要求
+ * 具有集群管理器的集群——这是任何Spark应用程序的一般需求，并在[部署指南](https://spark.apache.org/docs/latest/cluster-overview.html)中详细讨论。
+ * 应用打成jar包——须将流应用程序编译到JAR包中。如果使用[Spark -submit](https://spark.apache.org/docs/latest/submitting-applications.html)启动应用程序，则不需要在JAR中提供Spark和Spark流所对应的jar包。但是，如果您的应用程序使用高级的[数据源](https://spark.apache.org/docs/latest/streaming-programming-guide.html#advanced-sources)(例如Kafka、Flume)，那么您必须将所依赖的jar包及其依赖项打包到用于部署应用程序的JAR中。例如，使用KafkaUtils的应用程序必须在应用程序JAR中包含spark-streaming-kafka-0-10_2.12及其所有传递依赖项。
+ * 为执行器配置足够的内存-- 由于接收到的数据必须存储在内存中，所以必须为执行器配置足够的内存来保存接收到的数据。注意，如果您正在执行10分钟的窗口操作，则系统必须在内存中保留至少10分钟的数据。因此，应用程序的内存需求取决于其中使用的操作。
+  * 配置检查点——如果流应用程序需要它，那么必须将Hadoop API兼容容错存储中的一个目录(如HDFS、S3等)配置为检查点目录，并以检查点信息可用于故障恢复的方式编写流应用程序。有关更多细节，请参见检查点部分。
+  * 配置应用程序驱动程序的自动重启——为了从驱动程序失败中自动恢复，用于运行流应用程序的部署基础设施必须监视驱动程序进程，并在驱动程序失败时重新启动驱动程序。不同的集群管理器有不同的工具来实现这一点。
+
+    - Spark Standalone —可以提交一个Spark应用程序驱动程序在Spark Standalone集群中运行(请参阅[集群部署模式](https://spark.apache.org/docs/latest/spark-standalone.html#launching-spark-applications))，也就是说，应用程序驱动程序本身在一个工作节点上运行。此外，可以指示独立集群管理器监视驱动程序，并在驱动程序由于非零退出码或运行驱动程序的节点失败而失败时重新启动它。有关更多详细信息，请参阅【Spark standlone指南](https://spark.apache.org/docs/latest/spark-standalone.html)中的集群模式和监督。
+    - YARN -- Yarn支持类似的自动重新启动应用程序的机制。请参阅YARN文档的更多细节。
+    - Mesos - [Marathon](https://github.com/mesosphere/marathon)已经被用来实现Mesos。
+ * 配置写前日志——从Spark 1.2开始，我们就引入了写前日志，以实现强大的容错保证。如果启用，则从接收器接收到的所有数据都将写入配置检查点目录中的写前日志。这可以防止在驱动程序恢复时丢失数据，从而确保零数据丢失(在[容错语义](https://spark.apache.org/docs/latest/streaming-programming-guide.html#fault-tolerance-semantics)一节中详细讨论)。
+这可以通过设置配置参数spark.stream .receiver. writeaheadlog来启用，开启为true。然而，这些更强的容错可能以单个接收器的接收吞吐量为代价。这可以通过[并行运行](https://spark.apache.org/docs/latest/streaming-programming-guide.html#level-of-parallelism-in-data-receiving)更多的接收器来纠正，以增加总吞吐量。此外，建议在启用写前日志时禁用Spark中接收数据的复制，因为日志已经存储在复制的存储系统中。这可以通过将输入流的存储级别设置为StorageLevel.MEMORY_AND_DISK_SER来实现。在使用S3(或任何不支持刷新的文件系统)写前日志时，请记住启用spark.stream.driver. writeaheadlog.closeFileAfterWrite和 spark.streaming.receiver.writeAheadLog.closeFileAfterWrite。有关详细信息，请参阅[Spark Streaming](https://spark.apache.org/docs/latest/configuration.html#spark-streaming)配置。请注意，当启用I/O加密时，Spark不会加密写入write-ahead日志的数据。如果需要对写前日志数据进行加密，则应该将其存储在本地支持加密的文件系统中。
+ * 设置最大接收速率—如果集群资源不够大，流应用程序无法像接收数据一样快速处理数据，则可以通过设置记录/秒的最大速率限制来限制接收方的速率。参见配置参数spark.stream.receiver.maxRate的配置接收器和spark.streaming.kafka.maxRatePerPartitionmaxRatePerPartition直接配置kafka。在Spark 1.5中，我们引入了一个称为回压的特性，它消除了设置速率限制的需要，因为Spark Streaming自动计算速率限制，并在处理条件发生变化时动态调整它们。通过设置配置参数spark.stream.backpressure可以启用它的回压。启用为true。
+
+## 升级应用程序代码(Upgrading Application Code)
+
+如果正在运行的Spark STreaming应用程序需要使用新的应用程序代码进行升级，那么有两种可能的机制。
+ * 升级后的Spark Streaming应用程序将与现有应用程序并行启动和运行。一旦新服务器(接收与旧服务器相同的数据)被预热并准备好进入黄金时间，旧服务器就可以被关闭。注意，对于支持将数据发送到两个目的地(即、早期和升级的应用程序)。
+ * 现有应用程序被正常关闭(有关优美的关闭选项，请参阅[StreamingContext.stop(…)](https://spark.apache.org/docs/latest/api/scala/index.html#org.apache.spark.streaming.StreamingContext)或[JavaStreamingContext.stop(…)](https://spark.apache.org/docs/latest/api/java/index.html?org/apache/spark/streaming/api/java/JavaStreamingContext.html))确保已接收的数据在关机前已完全处理完毕。然后可以启动升级的应用程序，它将从先前的应用程序停止的地方开始处理。请注意，这只能在支持源端缓冲的输入源(如Kafka和Flume)中完成，因为需要在前一个应用程序宕机而升级的应用程序尚未启动时对数据进行缓冲。无法从升级前代码的早期检查点信息重新启动。检查点信息本质上包含序列化的Scala/Java/Python对象，尝试使用新的、修改过的类来反序列化对象可能会导致错误。在这种情况下，可以使用不同的检查点目录启动升级后的应用程序，也可以删除以前的检查点目录。
+
+## 监视应用程序(Monitoring Applications)
+除了Spark的[监控功能](https://spark.apache.org/docs/latest/monitoring.html)，还有一些特定于Spark流的附加功能。当使用StreamingContext时，Spark web UI会显示一个附加的流选项卡，其中显示关于正在运行的接收方(接收方是否活动、接收到的记录数量、接收方错误等)和完成的批(批处理时间、队列延迟等)的统计信息。这可以用来监视流应用程序的进度。
+
+web UI中的以下两个指标特别重要:
+ * 处理时间——处理每批数据的时间。
+ * 调度延迟——批处理在队列中等待前一批处理完成的时间。
+
+如果批处理时间始终大于批处理间隔和/或队列延迟不断增加，则表明系统无法像生成批处理那样快速地处理它们，并且正在处理落后。在这种情况下，可以考虑[减少](https://spark.apache.org/docs/latest/streaming-programming-guide.html#reducing-the-batch-processing-times)批处理时间。
+
+Spark Streaming程序的进程也可以使用StreamingListener接口进行监视，该接口允许您获得接收方状态和处理时间。请注意，这是一个开发人员API，它可能会得到改进(即更多信息能被获取)在未来。
